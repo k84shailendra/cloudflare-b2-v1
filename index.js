@@ -29,6 +29,9 @@ const HTTPS_PORT = "443";
 // How many times to retry a range request where the response is missing content-range
 const RANGE_RETRY_ATTEMPTS = 3;
 
+// Define Cache TTL (1 month in seconds)
+const BROWSER_CACHE_TTL_SECONDS = 2592000; // 30 * 24 * 60 * 60
+
 // Filter out cf-* and any other headers we don't want to include in the signature
 function filterHeaders(headers, env) {
     // Suppress irrelevant IntelliJ warning
@@ -42,13 +45,41 @@ function filterHeaders(headers, env) {
     );
 }
 
+// Helper function to create a Response suitable for HEAD requests (no body)
 function createHeadResponse(response) {
+    // Clone headers to make them mutable
+    const newHeaders = new Headers(response.headers);
     return new Response(null, {
-        headers: response.headers,
+        headers: newHeaders, // Use the cloned headers
         status: response.status,
         statusText: response.statusText
     });
 }
+
+// --- NEW Helper Function to Add Cache Headers ---
+// Takes an existing Response and returns a new one with updated Cache-Control
+function addCacheHeaders(response, cacheTtlSeconds) {
+    // Only cache successful responses
+    if (!response.ok) {
+        return response;
+    }
+
+    // Create new Headers object based on the response's headers
+    const newHeaders = new Headers(response.headers);
+
+    // Set the desired Cache-Control header (overwrites existing if present)
+    newHeaders.set('Cache-Control', `public, max-age=${cacheTtlSeconds}`);
+
+    // Return a new Response with the original body/status but modified headers
+    // Note: response.body can only be read once. We pass the stream directly.
+    return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: newHeaders
+    });
+}
+// --- End NEW Helper Function ---
+
 
 function isListBucketRequest(env, path) {
     const pathSegments = path.split('/');
@@ -130,9 +161,9 @@ export default {
                 // Remove leading file/ prefix from the path
                 url.pathname = path.replace(/^file\//, "");
             } else {
-                // Remove leading file/{bucket_name}/ prefix from the path 
+                // Remove leading file/{bucket_name}/ prefix from the path
                 url.pathname = path.replace(/^file\/[^/]+\//, "");
-            }            
+            }
         }
 
         // Sign the outgoing request
@@ -141,7 +172,7 @@ export default {
         // breaks the signature, resulting in a 403. So, change all HEADs to GETs. This is not too inefficient,
         // since we won't read the body of the response if the original request was a HEAD.
         const signedRequest = await client.sign(url.toString(), {
-            method: 'GET',
+            method: 'GET', // Always use GET upstream for signing consistency
             headers: headers
         });
 
@@ -152,6 +183,8 @@ export default {
         if (signedRequest.headers.has("range")) {
             let attempts = RANGE_RETRY_ATTEMPTS;
             let response;
+            let finalResponse; // Variable to hold the final response object
+
             do {
                 let controller = new AbortController();
                 response = await fetch(signedRequest.url, {
@@ -164,45 +197,64 @@ export default {
                     if (attempts < RANGE_RETRY_ATTEMPTS) {
                         console.log(`Retry for ${signedRequest.url} succeeded - response has content-range header`);
                     }
-                    // Break out of loop and return the response
+                    // Break out of loop and use this response
+                    finalResponse = response;
                     break;
                 } else if (response.ok) {
                     attempts -= 1;
                     console.error(`Range header in request for ${signedRequest.url} but no content-range header in response. Will retry ${attempts} more times`);
                     // Do not abort on the last attempt, as we want to return the response
                     if (attempts > 0) {
-                        controller.abort();
+                        // Abort the current fetch response body to release connection
+                         if(response.body) {
+                            // Consume the body to allow the connection to close cleanly
+                           await response.body.cancel();
+                        }
+                       // controller.abort(); // controller.abort() seems less reliable here than consuming body
+                    } else {
+                       // Last attempt failed, use this response
+                       finalResponse = response;
                     }
                 } else {
                     // Response is not ok, so don't retry
+                    finalResponse = response;
                     break;
                 }
             } while (attempts > 0);
 
-            if (attempts <= 0) {
+            if (!finalResponse) { // Should ideally not happen, but as a safeguard
+                 finalResponse = response;
+            }
+
+            if (attempts <= 0 && !finalResponse.headers.has("content-range")) {
                 console.error(`Tried range request for ${signedRequest.url} ${RANGE_RETRY_ATTEMPTS} times, but no content-range in response.`);
             }
 
             if (requestMethod === 'HEAD') {
-                // Original request was HEAD, so return a new Response without a body
-                return createHeadResponse(response);
+                // Original request was HEAD, create a HEAD response
+                const headResponse = createHeadResponse(finalResponse);
+                // Add cache headers and return
+                return addCacheHeaders(headResponse, BROWSER_CACHE_TTL_SECONDS);
             }
 
-            // Return whatever response we have rather than an error response
-            // This response cannot be aborted, otherwise it will raise an exception
-            return response;
+            // Return the final GET response after adding cache headers
+            return addCacheHeaders(finalResponse, BROWSER_CACHE_TTL_SECONDS);
+
+        } else {
+             // --- Normal GET/HEAD request (no range header involved) ---
+
+             // Send the signed request to B2
+            const response = await fetch(signedRequest);
+
+            if (requestMethod === 'HEAD') {
+                // Original request was HEAD, create a HEAD response
+                const headResponse = createHeadResponse(response);
+                 // Add cache headers and return
+                return addCacheHeaders(headResponse, BROWSER_CACHE_TTL_SECONDS);
+            }
+
+             // Return the upstream GET response after adding cache headers
+            return addCacheHeaders(response, BROWSER_CACHE_TTL_SECONDS);
         }
-
-        // Send the signed request to B2
-        const fetchPromise = fetch(signedRequest);
-
-        if (requestMethod === 'HEAD') {
-            const response = await fetchPromise;
-            // Original request was HEAD, so return a new Response without a body
-            return createHeadResponse(response);
-        }
-
-        // Return the upstream response unchanged
-        return fetchPromise;
     },
 };
